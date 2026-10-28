@@ -1,34 +1,31 @@
-"""Tk UI: the border that hugs the Roblox game area, the side panel, and the image capture tool."""
-import base64
+"""Tk UI: the border that hugs the Roblox game area and the side panel with its three modes.
+
+  Create  build macros from nodes, checkers and overseers (opens the editor)
+  Macro   run a macro
+  Input   import shared zips / Python macros into the runnable list
+"""
 import os
 import queue
-import re
+import shutil
 import time
 import tkinter as tk
 from datetime import datetime
-from tkinter import simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
-import cv2
-
-from . import config, inputs, vision, win32
+from . import config, engine, inputs, vision, win32
+from .editor import Editor
+from .flow import Flow, describe_step, import_zip, list_flows, make_ref
 from .hotkeys import HotkeyListener
+from .recorder import Recorder
 from .runner import MacroRunner, list_macros
+from .theme import BG, FG, FIELD, MUTED, OK, WARN, apply_style, listbox
+from .tools import CaptureTool, PointPicker, ask_form
 
-BG = "#1e1f24"
-FIELD = "#2a2c33"
-FG = "#e6e6e6"
-MUTED = "#9aa0aa"
-OK = "#3ecf6e"
-WARN = "#f0a43a"
 KEY_COLOR = "#ff00fe"  # overlay pixels of this colour are see-through
 PANEL_GAP = 6
 TICK_MS = 50
 LOG_LINES = 300
-
-
-def _photo(img):
-    ok, data = cv2.imencode(".png", img)
-    return tk.PhotoImage(data=base64.b64encode(data.tobytes()).decode())
+MODES = ("create", "macro", "input")
 
 
 class FrameOverlay:
@@ -71,89 +68,26 @@ class FrameOverlay:
             self.visible = False
 
 
-class CaptureTool:
-    """Freezes the frame on screen and lets the user drag out a region to save as an image."""
-
-    def __init__(self, app, client, image):
-        self.app = app
-        self.image = image
-        self.start = None
-        self.win = tk.Toplevel(app.root)
-        self.win.overrideredirect(True)
-        self.win.attributes("-topmost", True)
-        self.win.geometry(f"{client.width}x{client.height}+{client.left}+{client.top}")
-        self.photo = _photo(image)
-        c = self.canvas = tk.Canvas(self.win, width=client.width, height=client.height,
-                                    highlightthickness=0, bd=0, cursor="crosshair")
-        c.pack()
-        c.create_image(0, 0, anchor="nw", image=self.photo)
-        hint = c.create_text(client.width // 2, 18, fill=FG, font=("Segoe UI", 11, "bold"),
-                             text="Drag around what the macro should look for   ·   Esc to cancel")
-        x0, y0, x1, y1 = c.bbox(hint)
-        self.hint = (c.create_rectangle(x0 - 10, y0 - 5, x1 + 10, y1 + 5, fill=BG, outline=""), hint)
-        c.tag_raise(hint)
-        self.box = c.create_rectangle(0, 0, 0, 0, outline=OK, width=2, state="hidden")
-        self.label = c.create_text(0, 0, anchor="sw", fill=OK, font=("Consolas", 9), state="hidden")
-        c.bind("<ButtonPress-1>", self._press)
-        c.bind("<B1-Motion>", self._drag)
-        c.bind("<ButtonRelease-1>", self._release)
-        self.win.bind("<Escape>", lambda e: self.close())
-        self.win.focus_force()
-
-    def _clamp(self, event):
-        h, w = self.image.shape[:2]
-        return min(max(event.x, 0), w), min(max(event.y, 0), h)
-
-    def _press(self, event):
-        self.start = self._clamp(event)
-        for item in self.hint:
-            self.canvas.itemconfigure(item, state="hidden")
-        self.canvas.itemconfigure(self.box, state="normal")
-        self.canvas.itemconfigure(self.label, state="normal")
-        self._drag(event)
-
-    def _drag(self, event):
-        if not self.start:
-            return
-        (x0, y0), (x1, y1) = self.start, self._clamp(event)
-        self.canvas.coords(self.box, x0, y0, x1, y1)
-        self.canvas.coords(self.label, min(x0, x1), min(y0, y1) - 3)
-        self.canvas.itemconfigure(self.label, text=f"({min(x0, x1)}, {min(y0, y1)})  "
-                                                   f"{abs(x1 - x0)}x{abs(y1 - y0)}")
-
-    def _release(self, event):
-        if not self.start:
-            return
-        (x0, y0), (x1, y1) = self.start, self._clamp(event)
-        self.start = None
-        x, y, w, h = min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0)
-        if w < 4 or h < 4:
-            return
-        name = simpledialog.askstring(
-            "Save image", f"Region ({x}, {y}, {w}, {h})\n\nSave as images/<name>.png. Name:",
-            parent=self.win)
-        name = re.sub(r"[^\w\-]+", "_", (name or "").strip()).strip("_")
-        if not name:
-            return  # cancelled: let them drag again
-        vision.write_image(config.IMAGES_DIR / f"{name}.png", self.image[y:y + h, x:x + w])
-        self.app.log(f'Saved images/{name}.png\n  find_image("{name}")  region=({x}, {y}, {w}, {h})')
-        self.close()
-
-    def close(self):
-        self.win.destroy()
-
-
 class App:
     def __init__(self):
-        for folder in (config.MACROS_DIR, config.IMAGES_DIR, config.SCREENSHOTS_DIR):
+        for folder in (config.MACROS_DIR, config.IMAGES_DIR, config.SCREENSHOTS_DIR,
+                       config.FLOWS_DIR, config.LIBRARY_DIR, config.EXPORTS_DIR):
             folder.mkdir(exist_ok=True)
         self.root = tk.Tk()
         self.root.title("AA Macro")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.configure(bg=BG)
+        apply_style(self.root)
         self.events = queue.Queue()
         self.runner = MacroRunner(self.log)
+        self.recorder = Recorder(lambda: self.client,
+                                 lambda step: self.events.put(("step", step)),
+                                 lambda: self.events.put(("ask_delay",)), self.log)
+        self.recording = None   # (flow, node name) while recording
+        self.flow = None        # macro open in Create mode
+        self.editor = None
+        self.mode = None
         self.hwnd = None
         self.client = None
         self._next_search = 0.0
@@ -165,114 +99,144 @@ class App:
         self._status = None
         self._mouse_text = None
         self._last_error = None
-        self._macro_paths = {}
+        self._runnables = {}
 
         self._build_panel()
         self.overlay = FrameOverlay(self.root)
         self.root.geometry("+80+80")
+        self.set_mode("macro")
 
         self.hotkeys = HotkeyListener({
-            config.HOTKEY_RUN: lambda: self.events.put(("toggle",)),
-            config.HOTKEY_STOP: self.runner.stop,
+            config.HOTKEY_RUN: lambda: self.events.put(("f6",)),
+            config.HOTKEY_STOP: lambda: self.events.put(("f7",)),
             config.HOTKEY_EXIT: self.emergency_exit,
         }, self.log)
         self.hotkeys.start()
-        self.log(f"{config.HOTKEY_RUN.upper()} run/stop, {config.HOTKEY_STOP.upper()} stop, "
+        self.log(f"{config.HOTKEY_RUN.upper()} run/record, {config.HOTKEY_STOP.upper()} stop, "
                  f"{config.HOTKEY_EXIT.upper()} exit")
         self.root.after(TICK_MS, self._tick)
 
     # --------------------------------------------------------------- panel
 
     def _build_panel(self):
-        style = ttk.Style(self.root)
-        style.theme_use("clam")
-        style.configure(".", background=BG, foreground=FG, font=("Segoe UI", 9))
-        style.configure("TButton", background="#2f323a", foreground=FG, borderwidth=0,
-                        focusthickness=0, padding=(8, 5))
-        style.map("TButton", background=[("disabled", "#26282e"), ("active", "#3b3f49")],
-                  foreground=[("disabled", "#5c6068")])
-        style.configure("Accent.TButton", background="#2f6fde")
-        style.map("Accent.TButton", background=[("disabled", "#26282e"), ("active", "#3a7cf0")])
-        style.configure("Danger.TButton", background="#6e2b2b")
-        style.map("Danger.TButton", background=[("active", "#8a3434")])
-        style.configure("TCheckbutton", background=BG, foreground=FG)
-        style.map("TCheckbutton", background=[("active", BG)])
-        style.configure("Head.TLabel", font=("Segoe UI Semibold", 12))
-        style.configure("Section.TLabel", foreground=MUTED, font=("Segoe UI Semibold", 8))
-        style.configure("TCombobox", fieldbackground=FIELD, background="#2f323a", foreground=FG,
-                        arrowcolor=FG, borderwidth=0)
-        style.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", FG)],
-                  selectbackground=[("readonly", FIELD)], selectforeground=[("readonly", FG)])
-        style.configure("TSeparator", background="#33363e")
-        self.root.option_add("*TCombobox*Listbox.background", FIELD)
-        self.root.option_add("*TCombobox*Listbox.foreground", FG)
-
         body = ttk.Frame(self.root, padding=10)
         body.pack(fill="both", expand=True)
-
-        def section(text):
-            ttk.Separator(body).pack(fill="x", pady=(10, 6))
-            ttk.Label(body, text=text.upper(), style="Section.TLabel").pack(anchor="w", pady=(0, 4))
-
-        def row():
-            frame = ttk.Frame(body)
-            frame.pack(fill="x", pady=2)
-            return frame
+        self.body = body
 
         ttk.Label(body, text="AA Macro", style="Head.TLabel").pack(anchor="w")
         ttk.Label(body, text=f"Frame {config.FRAME_WIDTH} x {config.FRAME_HEIGHT}",
-                  foreground=MUTED).pack(anchor="w")
+                  style="Muted.TLabel").pack(anchor="w")
         self.status_label = tk.Label(body, bg=BG, fg=WARN, justify="left", anchor="w",
-                                     wraplength=210, font=("Segoe UI", 9))
+                                     wraplength=220, font=("Segoe UI", 9))
         self.status_label.pack(fill="x", pady=(6, 4))
-        ttk.Button(body, text="Snap to Roblox", command=self.snap).pack(fill="x", pady=2)
+        row = self._row(body)
+        ttk.Button(row, text="Snap to Roblox", command=self.snap).pack(side="left", fill="x", expand=True)
         self.lock_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(body, text="Keep size locked", variable=self.lock_var).pack(anchor="w", pady=2)
+        ttk.Checkbutton(row, text="Lock", variable=self.lock_var).pack(side="left", padx=(6, 0))
 
-        section("Macro")
-        self.macro_var = tk.StringVar()
-        self.macro_box = ttk.Combobox(body, textvariable=self.macro_var, state="readonly",
-                                      width=28, postcommand=self._refresh_macros)
-        self.macro_box.pack(fill="x", pady=2)
-        buttons = row()
-        self.run_button = ttk.Button(buttons, text=f"Run ({config.HOTKEY_RUN.upper()})",
-                                     style="Accent.TButton", command=self.run_selected)
-        self.run_button.pack(side="left", fill="x", expand=True, padx=(0, 2))
-        self.stop_button = ttk.Button(buttons, text=f"Stop ({config.HOTKEY_STOP.upper()})",
-                                      command=self.runner.stop)
-        self.stop_button.pack(side="left", fill="x", expand=True, padx=(2, 0))
+        ttk.Separator(body).pack(fill="x", pady=(10, 6))
+        modes = self._row(body)
+        self.mode_buttons = {}
+        for mode in MODES:
+            button = ttk.Button(modes, text=mode.title(), command=lambda m=mode: self.set_mode(m))
+            button.pack(side="left", fill="x", expand=True, padx=1)
+            self.mode_buttons[mode] = button
+        self.mode_area = ttk.Frame(body)
+        self.mode_area.pack(fill="x", pady=(6, 0))
+        self.mode_frames = {"create": self._build_create(), "macro": self._build_macro(),
+                            "input": self._build_input()}
 
-        section("Tools")
-        ttk.Button(body, text="Capture image…", command=self.capture_image).pack(fill="x", pady=2)
-        ttk.Button(body, text="Save screenshot", command=self.save_screenshot).pack(fill="x", pady=2)
-        folders = row()
-        ttk.Button(folders, text="macros/", command=lambda: os.startfile(config.MACROS_DIR)) \
-            .pack(side="left", fill="x", expand=True, padx=(0, 2))
-        ttk.Button(folders, text="images/", command=lambda: os.startfile(config.IMAGES_DIR)) \
-            .pack(side="left", fill="x", expand=True, padx=(2, 0))
-        readout = row()
+        ttk.Separator(body).pack(fill="x", pady=(10, 6))
+        readout = self._row(body)
         self.swatch = tk.Label(readout, bg=FIELD, width=2)
         self.swatch.pack(side="left", fill="y", padx=(0, 6))
-        self.mouse_label = tk.Label(readout, bg=BG, fg=FG, justify="left", anchor="w",
-                                    font=("Consolas", 9))
+        self.mouse_label = tk.Label(readout, bg=BG, fg=FG, justify="left", anchor="w", font=("Consolas", 9))
         self.mouse_label.pack(side="left", fill="x")
+        ttk.Button(readout, text="Screenshot", command=self.save_screenshot).pack(side="right")
 
-        section("Log")
-        self.log_text = tk.Text(body, height=10, width=30, bg="#15161a", fg=FG, bd=0,
+        self.log_text = tk.Text(body, height=8, width=34, bg="#15161a", fg=FG, bd=0,
                                 font=("Consolas", 8), wrap="word", state="disabled",
                                 highlightthickness=0, padx=6, pady=4)
-        self.log_text.pack(fill="both", expand=True, pady=2)
-
+        self.log_text.pack(fill="both", expand=True, pady=(8, 2))
         ttk.Button(body, text=f"Exit ({config.HOTKEY_EXIT.upper()})", style="Danger.TButton",
-                   command=self.exit_app).pack(fill="x", pady=(8, 0))
-        self._refresh_macros()
+                   command=self.exit_app).pack(fill="x", pady=(6, 0))
 
-    def _refresh_macros(self):
-        self._macro_paths = {p.stem: p for p in list_macros(config.MACROS_DIR)}
-        names = list(self._macro_paths)
-        self.macro_box["values"] = names
-        if self.macro_var.get() not in self._macro_paths:
-            self.macro_var.set(names[0] if names else "")
+    @staticmethod
+    def _row(parent):
+        frame = ttk.Frame(parent)
+        frame.pack(fill="x", pady=2)
+        return frame
+
+    def _build_create(self):
+        frame = ttk.Frame(self.mode_area)
+        ttk.Label(frame, text="Macro to edit", style="Section.TLabel").pack(anchor="w")
+        self.flow_var = tk.StringVar()
+        self.flow_box = ttk.Combobox(frame, textvariable=self.flow_var, state="readonly",
+                                     postcommand=self._refresh_flow_box)
+        self.flow_box.pack(fill="x", pady=2)
+        self.flow_box.bind("<<ComboboxSelected>>", lambda e: self._open_flow(self.flow_var.get()))
+        row = self._row(frame)
+        ttk.Button(row, text="New macro", command=self.new_flow).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        ttk.Button(row, text="Open editor", style="Accent.TButton", command=self.open_editor) \
+            .pack(side="left", fill="x", expand=True, padx=(2, 0))
+        self.record_label = tk.Label(frame, bg=BG, fg=MUTED, justify="left", anchor="w", wraplength=220,
+                                     font=("Segoe UI", 9), text="Not recording")
+        self.record_label.pack(fill="x", pady=(6, 0))
+        ttk.Label(frame, style="Muted.TLabel", justify="left", font=("Consolas", 8), text=(
+            "F6 records into the node selected\nin the editor. While recording:\n"
+            "  \\ + key   key press\n  ]         delay\n  [         click at cursor")).pack(anchor="w", pady=(4, 0))
+        return frame
+
+    def _build_macro(self):
+        frame = ttk.Frame(self.mode_area)
+        ttk.Label(frame, text="Macro to run", style="Section.TLabel").pack(anchor="w")
+        self.run_var = tk.StringVar()
+        self.run_box = ttk.Combobox(frame, textvariable=self.run_var, state="readonly",
+                                    postcommand=self._refresh_runnables)
+        self.run_box.pack(fill="x", pady=2)
+        row = self._row(frame)
+        self.run_button = ttk.Button(row, text=f"Run ({config.HOTKEY_RUN.upper()})", style="Accent.TButton",
+                                     command=self.run_selected)
+        self.run_button.pack(side="left", fill="x", expand=True, padx=(0, 2))
+        self.stop_button = ttk.Button(row, text=f"Stop ({config.HOTKEY_STOP.upper()})", command=self.runner.stop)
+        self.stop_button.pack(side="left", fill="x", expand=True, padx=(2, 0))
+        ttk.Button(frame, text="Capture image for .py macros…",
+                   command=lambda: self.capture(config.IMAGES_DIR, lambda name, region: None)) \
+            .pack(fill="x", pady=(6, 0))
+        return frame
+
+    def _build_input(self):
+        frame = ttk.Frame(self.mode_area)
+        row = self._row(frame)
+        ttk.Button(row, text="Import zip…", style="Accent.TButton", command=self.import_zip) \
+            .pack(side="left", fill="x", expand=True, padx=(0, 2))
+        ttk.Button(row, text="Add .py…", command=self.add_python_macro) \
+            .pack(side="left", fill="x", expand=True, padx=(2, 0))
+        ttk.Label(frame, text="Runnable macros", style="Section.TLabel").pack(anchor="w", pady=(6, 2))
+        self.input_list = listbox(frame, height=6)
+        self.input_list.pack(fill="x")
+        row = self._row(frame)
+        ttk.Button(row, text="Export zip", command=self.export_selected).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        ttk.Button(row, text="Remove", command=self.remove_selected).pack(side="left", fill="x", expand=True, padx=(2, 0))
+        row = self._row(frame)
+        for name, folder in (("exports/", config.EXPORTS_DIR), ("library/", config.LIBRARY_DIR)):
+            ttk.Button(row, text=name, command=lambda f=folder: os.startfile(f)) \
+                .pack(side="left", fill="x", expand=True, padx=1)
+        return frame
+
+    def set_mode(self, mode):
+        if mode == self.mode:
+            return
+        if self.recording and mode != "create":
+            self.stop_recording()
+        self.mode = mode
+        for name, frame in self.mode_frames.items():
+            frame.pack_forget()
+            self.mode_buttons[name].configure(style="ModeOn.TButton" if name == mode else "Mode.TButton")
+        self.mode_frames[mode].pack(fill="x")
+        self._refresh_runnables()
+        if mode == "create":
+            self._refresh_flow_box()
 
     def _set_status(self, text, color):
         if (text, color) != self._status:
@@ -296,6 +260,244 @@ class App:
             self.log_text.delete("1.0", f"{overflow + 1}.0")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    # --------------------------------------------------------- create mode
+
+    def _refresh_flow_box(self):
+        names = [p.name for p in list_flows()]
+        self.flow_box["values"] = names
+        if self.flow and self.flow.name in names:
+            self.flow_var.set(self.flow.name)
+        elif names and not self.flow:
+            self._open_flow(names[0])
+
+    def _open_flow(self, name):
+        if self.flow and self.flow.name == name:
+            return
+        if self.editor:
+            self.editor.close()
+        self.flow = Flow.load(config.FLOWS_DIR / name)
+        self.flow_var.set(name)
+
+    def new_flow(self):
+        answer = ask_form(self.root, "New macro", [{"key": "name", "label": "Macro name", "value": "my_macro"}])
+        if not answer:
+            return
+        if self.editor:
+            self.editor.close()
+        self.flow = Flow.create(answer["name"])
+        self.flow.add("node", "start")
+        self._refresh_flow_box()
+        self.log(f"Created macro {self.flow.name}")
+        self.open_editor()
+
+    def open_editor(self):
+        if not self.flow:
+            return self.new_flow()
+        if self.editor:
+            self.editor.win.deiconify()
+            self.editor.win.lift()
+            return
+        self.editor = Editor(self, self.flow)
+
+    def toggle_recording(self, flow, node):
+        if self.recording:
+            self.stop_recording()
+        else:
+            self.start_recording(flow, node)
+
+    def start_recording(self, flow, node):
+        if self.runner.running:
+            return self.log("Stop the running macro first")
+        if not self.hwnd:
+            return self.log("Roblox window not found")
+        self.recording = (flow, node)
+        self.recorder.start()
+        self.log(f"Recording into node {node}")
+        self._update_record_ui()
+        win32.focus(self.hwnd)
+
+    def stop_recording(self):
+        if not self.recording:
+            return
+        flow, node = self.recording
+        self.recorder.stop()
+        self.recording = None
+        self.log(f"Stopped recording {node}")
+        if node in flow.nodes:
+            self.save_node_to_library(flow, node)
+        self._update_record_ui()
+
+    def _update_record_ui(self):
+        if self.recording:
+            flow, node = self.recording
+            self.record_label.configure(text=f"● Recording {node} ({len(flow.nodes[node]['steps'])} steps)", fg=WARN)
+        else:
+            self.record_label.configure(text="Not recording", fg=MUTED)
+        if self.editor:
+            self.editor.update_record_state()
+
+    def _on_step(self, step):
+        if not self.recording:
+            return
+        flow, node = self.recording
+        flow.nodes[node]["steps"].append(step)
+        flow.save()
+        self.log(f"+ {describe_step(step)}")
+        self._update_record_ui()
+        if self.editor and self.editor.flow is flow:
+            self.editor.on_step_recorded(node)
+
+    def _ask_delay(self):
+        if not self.recording:
+            return
+        answer = ask_form(self.root, "Delay", [
+            {"key": "seconds", "label": "Seconds to wait", "kind": "float", "value": 1.0}])
+        if answer:
+            self._on_step({"type": "delay", "seconds": answer["seconds"]})
+        if self.hwnd:
+            win32.focus(self.hwnd)
+
+    def save_node_to_library(self, flow, node):
+        path = flow.save_node_to_library(node)
+        self.log(f"Saved node to {path.parent.name}/{path.name}")
+
+    def on_node_renamed(self, flow, old, new):
+        if self.recording == (flow, old):
+            self.recording = (flow, new)
+            self._update_record_ui()
+
+    def on_node_deleted(self, flow, node):
+        if self.recording == (flow, node):
+            self.stop_recording()
+
+    def test_piece(self, flow, kind, name):
+        """Launch one node/checker right away (or check an overseer's image)."""
+        if self.recording:
+            self.stop_recording()
+        if not self.hwnd:
+            return self.log("Roblox window not found")
+        if kind == "overseer":
+            self.runner.start(f"check {name}", lambda stop: engine.check_overseer(flow, name, stop, self.log))
+        else:
+            self.runner.start_flow(flow, start=make_ref(kind, name), only=True, label=f"test {name}")
+
+    def _freeze_game(self, open_tool):
+        """Bring Roblox above the editor, then screenshot it and open a capture/pick tool."""
+        if not self.client:
+            return self.log("Roblox window not found")
+        win32.focus(self.hwnd)
+
+        def opened():
+            if not self.client:
+                return self.log("Roblox window not found")
+            tool = open_tool(self.client, vision.grab(self.client))
+            tool.on_close = lambda: self.editor and self.editor.win.lift()
+        self.root.after(250, opened)  # give Windows a moment to repaint the game on top
+
+    def capture(self, images_dir, on_saved, suggested=""):
+        def saved(name, region):
+            self.log(f'Saved image "{name}"  region={region}')
+            on_saved(name, region)
+        self._freeze_game(lambda client, shot: CaptureTool(self.root, client, shot, images_dir, saved, suggested))
+
+    def pick_point(self, on_pick):
+        self._freeze_game(lambda client, shot: PointPicker(self.root, client, shot, on_pick))
+
+    # ---------------------------------------------------------- macro mode
+
+    def _refresh_runnables(self):
+        runnables = {p.name: ("flow", p) for p in list_flows()}
+        runnables.update({f"{p.stem} (python)": ("python", p) for p in list_macros(config.MACROS_DIR)})
+        self._runnables = runnables
+        names = list(runnables)
+        self.run_box["values"] = names
+        if self.run_var.get() not in runnables:
+            self.run_var.set(names[0] if names else "")
+        self.input_list.delete(0, "end")
+        for name in names:
+            self.input_list.insert("end", name)
+
+    def run_selected(self):
+        entry = self._runnables.get(self.run_var.get())
+        if not entry:
+            self.log("Pick a macro first")
+        elif not self.hwnd:
+            self.log("Roblox window not found")
+        elif entry[0] == "flow":
+            self.runner.start_flow(Flow.load(entry[1]))
+        else:
+            self.runner.start_script(entry[1])
+
+    def run_flow(self, flow):
+        if self.recording:
+            self.stop_recording()
+        if not self.hwnd:
+            return self.log("Roblox window not found")
+        flow.save()
+        self.runner.start_flow(flow)
+
+    # ---------------------------------------------------------- input mode
+
+    def import_zip(self):
+        paths = filedialog.askopenfilenames(parent=self.root, title="Import AA Macro zip",
+                                            filetypes=[("AA Macro zip", "*.zip")])
+        for path in paths:
+            try:
+                kind, name = import_zip(path)
+            except Exception as exc:
+                self.log(f"Import failed: {exc}")
+                continue
+            if kind == "flow":
+                self.log(f"Imported macro {name}, ready in Macro mode")
+            else:
+                self.log(f"Imported node {name} into the library (editor > + From library)")
+        self._refresh_runnables()
+
+    def add_python_macro(self):
+        paths = filedialog.askopenfilenames(parent=self.root, title="Add Python macro",
+                                            filetypes=[("Python macro", "*.py")])
+        for path in paths:
+            target = config.MACROS_DIR / os.path.basename(path)
+            if target.exists() and not messagebox.askyesno("Replace", f"{target.name} exists. Replace it?",
+                                                           parent=self.root):
+                continue
+            shutil.copyfile(path, target)
+            self.log(f"Added macros/{target.name}")
+        self._refresh_runnables()
+
+    def _input_selection(self):
+        selection = self.input_list.curselection()
+        return self._runnables.get(self.input_list.get(selection[0])) if selection else None
+
+    def export_selected(self):
+        entry = self._input_selection()
+        if not entry:
+            return self.log("Select a macro in the list first")
+        if entry[0] != "flow":
+            return self.log("Python macros are shared by copying the .py file")
+        path = Flow.load(entry[1]).export_zip()
+        self.log(f"Exported {path.parent.name}/{path.name}")
+
+    def remove_selected(self):
+        entry = self._input_selection()
+        if not entry:
+            return
+        kind, path = entry
+        if not messagebox.askyesno("Remove", f"Delete {path.name} from the runnable list? "
+                                   "This deletes its files (export a zip first to keep a copy).",
+                                   parent=self.root):
+            return
+        if self.flow and kind == "flow" and self.flow.folder == path:
+            if self.editor:
+                self.editor.close()
+            self.flow = None
+        if kind == "flow":
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        self.log(f"Removed {path.name}")
+        self._refresh_runnables()
 
     # ------------------------------------------------------------- actions
 
@@ -322,26 +524,23 @@ class App:
                      f"{config.FRAME_WIDTH}x{config.FRAME_HEIGHT}; change FRAME_WIDTH/HEIGHT "
                      "in aamacro/config.py.")
 
-    def run_selected(self):
-        path = self._macro_paths.get(self.macro_var.get())
-        if not path:
-            self.log("Pick a macro first (files in macros/)")
-        elif not self.hwnd:
-            self.log("Roblox window not found")
-        else:
-            self.runner.start(path)
-
-    def toggle_run(self):
-        if self.runner.running:
+    def on_f6(self):
+        if self.mode == "create":
+            if self.recording:
+                self.stop_recording()
+            elif self.editor and self.editor.selected_node():
+                self.start_recording(self.flow, self.editor.selected_node())
+            else:
+                self.log("Open the editor and select a node to record into")
+        elif self.runner.running:
             self.runner.stop()
         else:
             self.run_selected()
 
-    def capture_image(self):
-        if not self.client:
-            self.log("Roblox window not found")
-            return
-        CaptureTool(self, self.client, vision.grab(self.client))
+    def on_f7(self):
+        if self.recording:
+            self.stop_recording()
+        self.runner.stop()
 
     def save_screenshot(self):
         if not self.client:
@@ -352,9 +551,12 @@ class App:
         self.log(f"Saved screenshots/{path.name}")
 
     def exit_app(self):
+        self.recorder.stop()
         self.runner.stop()
         inputs.release_all()
         self.hotkeys.stop()
+        if self.editor:
+            self.flow.save()
         self.root.destroy()
 
     def emergency_exit(self):
@@ -388,10 +590,17 @@ class App:
                 event = self.events.get_nowait()
             except queue.Empty:
                 return
-            if event[0] == "log":
+            kind = event[0]
+            if kind == "log":
                 self._append_log(event[1])
-            elif event[0] == "toggle":
-                self.toggle_run()
+            elif kind == "f6":
+                self.on_f6()
+            elif kind == "f7":
+                self.on_f7()
+            elif kind == "step":
+                self._on_step(event[1])
+            elif kind == "ask_delay":
+                self._ask_delay()
 
     def _track_roblox(self):
         now = time.monotonic()
@@ -438,12 +647,13 @@ class App:
         self._set_topmost(True)
 
     def _place(self, client, color):
-        foreground = win32.foreground_window()
-        active = foreground == self.hwnd or win32.is_own_window(foreground)
+        # Border and always-on-top panel only while the game (or the panel) is in
+        # front, so they never float over other apps or over the editor.
+        active = win32.foreground_window() in (self.hwnd, win32.root_window(self.root.winfo_id()))
         if active:
             self.overlay.show(client, color)
         else:
-            self.overlay.hide()  # don't float over other apps
+            self.overlay.hide()
         self._set_topmost(active)
 
         bounds = win32.visible_bounds(self.hwnd)
@@ -465,7 +675,7 @@ class App:
             self._topmost = topmost
 
     def _update_mouse_readout(self):
-        text, color = "Mouse  —", FIELD
+        text, color = "Mouse  —\nRGB    —", FIELD
         if self.client:
             sx, sy = win32.cursor_pos()
             x, y = sx - self.client.left, sy - self.client.top
@@ -474,7 +684,7 @@ class App:
                 text = f"Mouse  {x}, {y}\nRGB    {r}, {g}, {b}"
                 color = f"#{r:02x}{g:02x}{b:02x}"
             else:
-                text = "Mouse  outside frame"
+                text = "Mouse  outside\nRGB    —"
         if text != self._mouse_text:
             self.mouse_label.configure(text=text)
             self.swatch.configure(bg=color)

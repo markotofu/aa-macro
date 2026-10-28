@@ -1,6 +1,6 @@
 """Image checks and branching: a typical farm loop.
 
-Before running it, use the panel's "Capture image…" button to save these
+Before running it, use Macro mode's "Capture image for .py macros…" button to save these
 pictures from your game (names must match):
     play_button   the button that starts a match
     victory       something only shown when you win

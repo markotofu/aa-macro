@@ -60,6 +60,9 @@ user32.GetSystemMetrics.restype = ctypes.c_int
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 user32.SetCursorPos.restype = wintypes.BOOL
 user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+MAPVK_VK_TO_CHAR = 2
 
 KEY_NAMES = {
     "space": 0x20, "enter": 0x0D, "return": 0x0D, "tab": 0x09, "esc": 0x1B, "escape": 0x1B,
@@ -72,6 +75,10 @@ KEY_NAMES = {
 }
 # Keys that live on the "extended" half of the keyboard need an extra flag.
 EXTENDED_VKS = {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0xA3, 0xA5}
+# Keys the recorder watches: everything except mouse buttons, the generic
+# shift/ctrl/alt codes (their left/right versions are watched instead) and Windows keys.
+RECORDABLE_VKS = [vk for vk in range(0x08, 0xFF) if vk not in (0x10, 0x11, 0x12, 0x5B, 0x5C)]
+_SIDED_NAMES = {0xA0: "shift", 0xA1: "rshift", 0xA2: "ctrl", 0xA3: "rctrl", 0xA4: "alt", 0xA5: "ralt"}
 
 _lock = threading.Lock()
 _held_keys = set()
@@ -88,6 +95,22 @@ def vk_for(key):
         if code != -1:
             return code & 0xFF
     raise ValueError(f"Unknown key {key!r}")
+
+
+def key_name(vk):
+    """The name vk_for() understands for a virtual-key code, or None."""
+    if vk in _SIDED_NAMES:
+        return _SIDED_NAMES[vk]
+    for name, code in KEY_NAMES.items():
+        if code == vk:
+            return name
+    char = user32.MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) & 0xFFFF
+    return chr(char).lower() if char >= 0x20 else None
+
+
+def is_pressed(vk):
+    """True while a key is physically held down (works whatever app has focus)."""
+    return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
 
 def _send(*events):
@@ -145,6 +168,13 @@ def move_to(x, y):
     # from one pixel away instead of teleporting.
     _send(_mouse_event(flags, *_absolute(x + 1, y)), _mouse_event(flags, *_absolute(x, y)))
     user32.SetCursorPos(x, y)  # absolute coords are scaled; this pins the exact pixel
+
+
+def move_raw(x, y):
+    """One plain cursor move to screen pixel (x, y); used for each step of a glide."""
+    flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+    _send(_mouse_event(flags, *_absolute(x, y)))
+    user32.SetCursorPos(x, y)
 
 
 def move_relative(dx, dy):

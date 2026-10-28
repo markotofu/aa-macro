@@ -1,15 +1,15 @@
-"""Loads a macro file and runs its run(m) on a background thread."""
+"""Runs one macro job at a time on a background thread."""
 import importlib.util
 import threading
 import traceback
 from pathlib import Path
 
-from . import inputs
+from . import engine, inputs
 from .api import Macro, MacroStopped
 
 
 def list_macros(folder):
-    """Macro files in the folder; names starting with "_" are hidden."""
+    """Python macro files in the folder; names starting with "_" are hidden."""
     return sorted(p for p in Path(folder).glob("*.py") if not p.name.startswith("_"))
 
 
@@ -34,30 +34,42 @@ class MacroRunner:
     def running(self):
         return self._thread is not None and self._thread.is_alive()
 
-    def start(self, path):
+    def start(self, label, job):
+        """Run job(stop_event) in the background unless something is already running."""
         if self.running:
-            self._log("A macro is already running")
+            self._log("Something is already running (F7 stops it)")
             return
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, args=(Path(path), self._stop),
+        self._thread = threading.Thread(target=self._run, args=(label, job, self._stop),
                                         name="macro", daemon=True)
         self._thread.start()
+
+    def start_script(self, path):
+        path = Path(path)
+
+        def job(stop):
+            run = _load(path)
+            m = Macro(stop, self._log)
+            m.focus()
+            run(m)
+        self.start(path.stem, job)
+
+    def start_flow(self, flow, start=None, only=False, label=None):
+        self.start(label or flow.name,
+                   lambda stop: engine.run_flow(flow, stop, self._log, start=start, only=only))
 
     def stop(self):
         if self.running:
             self._stop.set()
 
-    def _run(self, path, stop):
-        self._log(f"Started {path.stem}")
+    def _run(self, label, job, stop):
+        self._log(f"Started {label}")
         try:
-            run = _load(path)
-            m = Macro(stop, self._log)
-            m.focus()
-            run(m)
-            self._log(f"Finished {path.stem}")
+            job(stop)
+            self._log(f"Finished {label}")
         except MacroStopped:
-            self._log(f"Stopped {path.stem}")
+            self._log(f"Stopped {label}")
         except Exception:
-            self._log(f"Error in {path.stem}:\n{traceback.format_exc(limit=-3)}")
+            self._log(f"Error in {label}:\n{traceback.format_exc(limit=-3)}")
         finally:
             inputs.release_all()

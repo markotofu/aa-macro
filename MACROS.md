@@ -1,4 +1,8 @@
-# Writing macros
+# Writing Python macros
+
+> Most macros are easier to build in **Create mode** without code (see README.md).
+> Python macros are the advanced option, for logic the editor can't express.
+
 
 A macro is a Python file in `macros/` with one function, `run(m)`. When you press
 **Run** (or F6), the app brings Roblox to the front and calls `run(m)`. The `m`
@@ -9,7 +13,7 @@ build any logic you want. The macro runs on its own and never waits on you.
 ```python
 # macros/my_macro.py
 def run(m):
-    m.click(512, 288)
+    m.click(400, 300)
     m.press("w", hold=2)
     if m.wait_for_image("victory", timeout=60):
         m.log("won")
@@ -21,7 +25,7 @@ Files starting with `_` (like `_template.py`) don't show up in the list.
 ## Coordinates
 
 Every position is a pixel **inside the frame**. `(0, 0)` is the top-left of the game
-area and `(1023, 575)` is the bottom-right (the size is set in `aamacro/config.py`).
+area and `(799, 599)` is the bottom-right (the size is set in `aamacro/config.py`).
 The frame is always resized to exactly this size, so the same numbers hit the same
 spot on any monitor, at any resolution or Windows scaling. Points outside the frame
 are refused with an error.
@@ -38,7 +42,7 @@ search to part of the screen, which is faster and avoids false matches.
 ## Images
 
 1. Get the game showing the thing you want to detect.
-2. Click **Capture image…** in the panel. The game freezes under a crosshair.
+2. In **Macro** mode, click **Capture image for .py macros…**. The game freezes under a crosshair.
 3. Drag a box around the thing and give it a name, for example `play_button`.
 4. It is saved as `images/play_button.png`, and the log prints its region.
 
@@ -46,8 +50,8 @@ Use it in a macro by name: `m.find_image("play_button")`. Tips:
 
 - Crop tightly around something that always looks the same. Leave out changing
   numbers, animated parts and the 3D world behind it.
-- `confidence` (0 to 1, default 0.85) is how exact the match must be. Lower it
-  (e.g. 0.75) if a match is missed; raise it if the wrong thing is found.
+- `confidence` (0 to 1, default 0.8) is how exact the match must be. Lower it
+  (e.g. 0.7) if a match is missed; raise it if the wrong thing is found.
 - For one solid colour, `find_color` / `color_matches` are faster than an image.
 
 ## Branching on what's on screen

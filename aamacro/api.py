@@ -4,15 +4,22 @@ Every coordinate is a pixel inside the fixed-size frame: (0, 0) is the
 top-left of the Roblox game area and (FRAME_WIDTH-1, FRAME_HEIGHT-1) the
 bottom-right, no matter where the window is or how big the monitor is.
 """
+import math
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 from . import config, inputs, vision, win32
 
 
 class MacroStopped(Exception):
     """Raised inside a macro when the user presses Stop; ends the macro."""
+
+
+class MacroInterrupted(Exception):
+    """Raised inside a node when an overseer spots its image and takes over."""
 
 
 @dataclass(frozen=True)
@@ -31,11 +38,13 @@ class Match:
 
 
 class Macro:
-    def __init__(self, stop_event, log):
+    def __init__(self, stop_event, log, images_dir=None, interrupt=None):
         self._stop = stop_event
+        self._interrupt = interrupt
         self._log = log
         self._hwnd = None
         self._warned_size = False
+        self.images_dir = Path(images_dir or config.IMAGES_DIR)
         self.width = config.FRAME_WIDTH
         self.height = config.FRAME_HEIGHT
 
@@ -45,6 +54,8 @@ class Macro:
         """Raise MacroStopped if Stop was pressed. Call it inside long pure-Python loops."""
         if self._stop.is_set():
             raise MacroStopped()
+        if self._interrupt is not None and self._interrupt.is_set():
+            raise MacroInterrupted()
 
     @property
     def stopped(self):
@@ -125,9 +136,35 @@ class Macro:
 
     # --------------------------------------------------------------- mouse
 
-    def move(self, x, y=None):
-        """Move the cursor to a frame point. Accepts x, y / (x, y) / a Match."""
-        inputs.move_to(*self._to_screen(x, y))
+    def move(self, x, y=None, glide=True):
+        """Move the cursor to a frame point. Accepts x, y / (x, y) / a Match.
+
+        By default the cursor glides there along a slight curve instead of
+        teleporting (see MOUSE_GLIDE in config.py).
+        """
+        tx, ty = self._to_screen(x, y)
+        if glide and config.MOUSE_GLIDE:
+            self._glide(tx, ty)
+        inputs.move_to(tx, ty)
+
+    def _glide(self, tx, ty):
+        sx, sy = win32.cursor_pos()
+        distance = math.hypot(tx - sx, ty - sy)
+        if distance < 3:
+            return
+        duration = min(max(distance / config.MOUSE_SPEED, config.MOUSE_GLIDE_MIN), config.MOUSE_GLIDE_MAX)
+        steps = max(2, int(duration / 0.01))
+        # Bend the path a little through a control point off the straight line.
+        bend = random.uniform(-0.08, 0.08) * distance
+        cx = (sx + tx) / 2 - (ty - sy) / distance * bend
+        cy = (sy + ty) / 2 + (tx - sx) / distance * bend
+        for i in range(1, steps):
+            t = i / steps
+            t = t * t * (3 - 2 * t)  # ease in and out
+            px = (1 - t) ** 2 * sx + 2 * (1 - t) * t * cx + t * t * tx
+            py = (1 - t) ** 2 * sy + 2 * (1 - t) * t * cy + t * t * ty
+            inputs.move_raw(round(px), round(py))
+            self.wait(duration / steps)
 
     def mouse_position(self):
         """Cursor position in frame coordinates, or None if it is outside the frame."""
@@ -171,7 +208,7 @@ class Macro:
             steps = max(1, int(duration / 0.015))
             for i in range(1, steps + 1):
                 t = i / steps
-                self.move(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+                self.move(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, glide=False)
                 self.wait(duration / steps)
         finally:
             self.mouse_up(button)
@@ -251,17 +288,21 @@ class Macro:
         name = name or datetime.now().strftime("frame_%Y%m%d_%H%M%S")
         path = config.SCREENSHOTS_DIR / f"{name}.png"
         vision.write_image(path, self.screenshot())
-        self.log(f"Saved {path.relative_to(config.ROOT_DIR)}")
+        self.log(f"Saved {path.parent.name}/{path.name}")
         return path
 
     def _image_path(self, name):
-        path = config.IMAGES_DIR / name
+        path = self.images_dir / name
         if not path.suffix:
             path = path.with_suffix(".png")
         if not path.exists():
-            raise FileNotFoundError(f"images/{path.name} not found. "
-                                    "Make it with the panel's 'Capture image' button.")
+            raise FileNotFoundError(f"{self.images_dir.name}/{path.name} not found. "
+                                    "Make it with a 'Capture image' button.")
         return path
+
+    def find_image_in(self, shot, name, region=None, confidence=None):
+        """Like find_image, but searches a screenshot you already took (faster for many images)."""
+        return self._search(name, shot, region, confidence)
 
     def _search(self, name, shot, region, confidence):
         x0, y0, w, h = self._region(region)
